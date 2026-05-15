@@ -1,0 +1,790 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI Student Observation Room</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            room: { bg: '#0f1419', panel: '#1a2332', accent: '#3b82f6', muted: '#94a3b8' }
+          }
+        }
+      }
+    };
+  </script>
+</head>
+<body class="bg-room-bg text-slate-100 min-h-screen font-sans antialiased">
+  <div id="app-root"></div>
+
+  <script type="module">
+    // =============================================================================
+    // ---- store ----
+    // =============================================================================
+    const FREE_TIER_MODELS = [
+      // Text-capable models supported by v1beta generateContent on the free tier
+      { id: 'gemini-3.1-flash-lite-preview', label: 'Gemini 3.1 Flash-Lite (preview)' },
+      { id: 'gemini-2.5-flash', label: 'Gemini 2.5 Flash' },
+      { id: 'gemini-2.5-flash-lite', label: 'Gemini 2.5 Flash-Lite' },
+      // If your key has older access, you can also try:
+      { id: 'gemini-1.5-flash', label: 'Gemini 1.5 Flash' },
+      { id: 'gemini-1.5-pro', label: 'Gemini 1.5 Pro' },
+    ];
+    const API_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
+
+    const state = {
+      apiKey: '',
+      notesLog: [],
+      chat: [],
+      analysis: null,
+      examAnswers: {},
+      examItems: [],
+      grades: [],
+      busy: false,
+      busyLabel: '',
+      error: null,
+      activeTab: 'upload',
+      showRubric: false,
+      statusLine: '',
+      model: FREE_TIER_MODELS[0].id,
+      showSettingsModal: false,
+    };
+
+    function loadSettings() {
+      state.apiKey = localStorage.getItem('geminiApiKey') || '';
+      const savedModel = localStorage.getItem('geminiModel') || '';
+      if (FREE_TIER_MODELS.some((m) => m.id === savedModel)) {
+        state.model = savedModel;
+      }
+    }
+    function saveKey(key) {
+      state.apiKey = key.trim();
+      if (state.apiKey) localStorage.setItem('geminiApiKey', state.apiKey);
+      else localStorage.removeItem('geminiApiKey');
+    }
+    function saveModel(modelId) {
+      const validId = FREE_TIER_MODELS.some((m) => m.id === modelId)
+        ? modelId
+        : FREE_TIER_MODELS[0].id;
+      state.model = validId;
+      localStorage.setItem('geminiModel', validId);
+    }
+
+    // =============================================================================
+    // ---- bracketSeek ----
+    // =============================================================================
+    /**
+     * Extract first balanced JSON object or array from text (handles filler outside).
+     */
+    function bracketSeek(text) {
+      if (!text || typeof text !== 'string') return null;
+      const iObj = text.indexOf('{');
+      const iArr = text.indexOf('[');
+      let start = -1;
+      if (iObj === -1) start = iArr;
+      else if (iArr === -1) start = iObj;
+      else start = Math.min(iObj, iArr);
+      if (start === -1) return null;
+
+      const stack = [];
+      let inStr = false;
+      let strQuote = '';
+      let escaped = false;
+
+      for (let i = start; i < text.length; i++) {
+        const c = text[i];
+
+        if (inStr) {
+          if (escaped) {
+            escaped = false;
+            continue;
+          }
+          if (c === '\\') {
+            escaped = true;
+            continue;
+          }
+          if (c === strQuote) {
+            inStr = false;
+            strQuote = '';
+          }
+          continue;
+        }
+
+        if (c === '"' || c === "'") {
+          inStr = true;
+          strQuote = c;
+          continue;
+        }
+
+        if (c === '{') stack.push('}');
+        else if (c === '[') stack.push(']');
+        else if (c === '}' || c === ']') {
+          if (stack.length && stack[stack.length - 1] === c) {
+            stack.pop();
+            if (stack.length === 0) {
+              return text.slice(start, i + 1);
+            }
+          }
+        }
+      }
+      return null;
+    }
+
+    function parseJsonLoose(text) {
+      const slice = bracketSeek(text);
+      const raw = slice ?? String(text).trim();
+      try {
+        return JSON.parse(raw);
+      } catch (e) {
+        throw new Error(`Could not parse JSON from model output: ${e.message}`);
+      }
+    }
+
+    // =============================================================================
+    // ---- prompts ----
+    // =============================================================================
+    const TEACHING_SYSTEM = `You are the AI Student in a teaching simulator.
+
+Trait: Absolute Zero-Knowledge Start. You must not know anything (math, science, history, etc.) unless the Teacher has explicitly taught it in this conversation session.
+Trait: Proactive Curiosity. Never reply with only acknowledgment. Always include one clarifying question about the concept to show you are thinking.
+Trait: Hidden Memory. Every turn you MUST output structured internalNotes capturing what you learned (JSON field below).
+
+Output ONLY valid JSON (no markdown fences, no extra prose). Schema:
+{
+  "internalNotes": {
+    "concept": "short label for what was taught this turn",
+    "facts": ["atomic fact strings"],
+    "links": ["A->B causal or logical links between taught ideas"]
+  },
+  "shortReply": "brief visible reply to the teacher (1-3 sentences)",
+  "clarifyingQuestion": "one question about the concept"
+}`;
+
+    function buildTeachingUserPayload(teacherLine, priorChat) {
+      let ctx = '';
+      for (const m of priorChat) {
+        if (m.role === 'teacher') ctx += `TEACHER: ${m.text}\n`;
+        else ctx += `STUDENT (shortReply): ${m.shortReply}\n`;
+      }
+      ctx += `TEACHER: ${teacherLine}\n`;
+      return ctx + `\nRespond with ONLY the JSON object for your turn.`;
+    }
+
+    const ANALYZER_SYSTEM = `You analyze homework documents (PDF or images). Output ONLY valid JSON (no markdown, no extra text).
+
+Synthesize small sub-topics into a small set of broadTopics (high-level, not cluttered).
+
+For each homework question you can identify, produce:
+- id: stable string id like "q1", "q2"
+- topic: which broad topic it belongs to
+- prompt: the question text
+- goldenBullets: array of strings where EACH string is ONE essential fact/point worth exactly 1 point for grading. Decompose the ideal answer into minimum essential bullets.
+
+Also produce masteryChallenges: EXACTLY one challenge per broadTopics entry (same order), each with:
+- topic: matches the broad topic string
+- prompt: one high-difficulty "curveball" question for that topic
+- goldenBullets: same 1-point-per-bullet rubric
+
+Schema:
+{
+  "broadTopics": string[],
+  "questions": { "id": string, "topic": string, "prompt": string, "goldenBullets": string[] }[],
+  "masteryChallenges": { "topic": string, "prompt": string, "goldenBullets": string[] }[]
+}`;
+
+    const STUDENT_EXAM_INSTRUCTION = `You are a blank slate. You have no outside knowledge. Only use the TEACHING CONTEXT. You may use logic and inference based on taught concepts, but if a concept is missing, you must say 'I haven't learned this yet'.`;
+
+    function buildTeachingContextBlock() {
+      const lines = [];
+      state.notesLog.forEach((n, idx) => {
+        lines.push(`--- Note ${idx + 1}: ${n.concept || 'concept'} ---`);
+        (n.facts || []).forEach((f) => lines.push(`FACT: ${f}`));
+        (n.links || []).forEach((l) => lines.push(`LINK: ${l}`));
+      });
+      return lines.join('\n');
+    }
+
+    function buildExamUserMessage(questionPrompt) {
+      return `TEACHING CONTEXT (only knowledge you may use):\n${buildTeachingContextBlock() || '(empty — you have not been taught anything yet)'}\n\nQUESTION:\n${questionPrompt}\n\nAnswer based only on TEACHING CONTEXT. Output ONLY valid JSON: {"examAnswer": "<your answer>"}`;
+    }
+
+    const GRADER_SYSTEM = `You are a strict grader. Compare the student's answer to the rubric bullets.
+
+For each question, check how many rubric bullets the student successfully explained. 1 bullet = 1 point. Return an array of 'missedBullets' for feedback.
+
+Output ONLY valid JSON (no markdown, no extra text). Schema:
+{
+  "questionId": string,
+  "hitBullets": number[],
+  "missedBullets": number[],
+  "pointsEarned": number,
+  "pointsPossible": number,
+  "feedback": string
+}
+
+hitBullets and missedBullets are 0-based indices into the provided goldenBullets array. pointsEarned must equal hitBullets.length. pointsPossible must equal goldenBullets.length.`;
+
+    function buildGraderUserContent(questionId, prompt, goldenBullets, studentAnswer) {
+      return `questionId: ${questionId}
+QUESTION PROMPT:
+${prompt}
+
+GOLDEN BULLETS (index order matters):
+${goldenBullets.map((b, i) => `[${i}] ${b}`).join('\n')}
+
+STUDENT ANSWER:
+${studentAnswer}
+
+Grade strictly. Return JSON only.`;
+    }
+
+    // =============================================================================
+    // ---- gemini ----
+    // =============================================================================
+    async function callGemini({ systemInstruction, userText, parts, responseJson }) {
+      const key = state.apiKey;
+      if (!key) throw new Error('Missing API key');
+
+      const url = `${API_BASE}/${state.model}:generateContent?key=${encodeURIComponent(key)}`;
+
+      const body = {
+        contents: [
+          {
+            role: 'user',
+            parts: parts && parts.length ? parts : [{ text: userText || '' }],
+          },
+        ],
+        systemInstruction: systemInstruction
+          ? { parts: [{ text: systemInstruction }] }
+          : undefined,
+        generationConfig: {
+          temperature: 0.4,
+          ...(responseJson ? { responseMimeType: 'application/json' } : {}),
+        },
+      };
+
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const msg = data?.error?.message || res.statusText || 'Request failed';
+        throw new Error(msg);
+      }
+
+      const text =
+        data?.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('') ?? '';
+      return text;
+    }
+
+    function fileToGenerativePart(file, base64Data) {
+      const mimeType = file.type || 'application/octet-stream';
+      return {
+        inlineData: { mimeType, data: base64Data },
+      };
+    }
+
+    function readFileAsBase64(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const dataUrl = reader.result;
+          const base64 = String(dataUrl).split(',')[1];
+          resolve(base64);
+        };
+        reader.onerror = reject;
+        reader.readAsDataURL(file);
+      });
+    }
+
+    // =============================================================================
+    // ---- ui helpers ----
+    // =============================================================================
+    function escapeHtml(s) {
+      if (s == null) return '';
+      return String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+    }
+
+    function setBusy(on, label = '') {
+      state.busy = on;
+      state.busyLabel = label;
+      // Clear stale errors only when starting new work.
+      if (on) state.error = null;
+      render();
+    }
+
+    function setError(e) {
+      state.error = e?.message || String(e);
+      render();
+    }
+
+    // =============================================================================
+    // ---- render ----
+    // =============================================================================
+    const root = document.getElementById('app-root');
+
+    function render() {
+      const keyOk = !!state.apiKey;
+      const tabs = ['upload', 'study', 'exam', 'results'];
+      const showSettings = !keyOk || state.showSettingsModal;
+
+      root.innerHTML = `
+        <!-- API key modal -->
+        <div class="fixed inset-0 z-50 flex items-center justify-center p-4 ${showSettings ? '' : 'hidden'}" id="key-modal" aria-modal="true">
+          <div class="absolute inset-0 bg-black/70"></div>
+          <div class="relative bg-room-panel border border-slate-700 rounded-xl p-6 max-w-md w-full shadow-xl">
+            <h2 class="text-lg font-semibold text-white mb-2">Gemini settings</h2>
+            <p class="text-sm text-slate-400 mb-4">Choose a free-tier text model and manage your API key. Settings are stored only in this browser (localStorage).</p>
+            <label for="model-select" class="block text-xs text-slate-400 mb-1">Gemini model (free tier)</label>
+            <select id="model-select" class="w-full bg-room-bg border border-slate-600 rounded-lg px-3 py-2 text-sm mb-3 focus:ring-2 focus:ring-room-accent outline-none">
+              ${FREE_TIER_MODELS.map((m) => `<option value="${escapeHtml(m.id)}" ${state.model === m.id ? 'selected' : ''}>${escapeHtml(m.label)} (${escapeHtml(m.id)})</option>`).join('')}
+            </select>
+            <p class="text-xs text-slate-500 mb-3">Live audio models (for example, Gemini Flash Live) use a different realtime API and are not compatible with this app's current request flow.</p>
+            <label for="key-input" class="block text-xs text-slate-400 mb-1">Gemini API key</label>
+            <input type="password" id="key-input" class="w-full bg-room-bg border border-slate-600 rounded-lg px-3 py-2 text-sm mb-3 focus:ring-2 focus:ring-room-accent outline-none" placeholder="${keyOk ? 'Leave blank to keep current key' : 'API key'}" />
+            <div class="flex gap-2">
+              <button type="button" id="key-save" class="flex-1 bg-blue-600 hover:bg-blue-500 text-white font-medium py-2 rounded-lg">${keyOk ? 'Save settings' : 'Save & continue'}</button>
+              ${keyOk ? '<button type="button" id="settings-cancel" class="px-4 bg-slate-700 hover:bg-slate-600 text-slate-100 font-medium py-2 rounded-lg">Cancel</button>' : ''}
+            </div>
+          </div>
+        </div>
+
+        <header class="border-b border-slate-800 bg-room-panel/80 backdrop-blur sticky top-0 z-40">
+          <div class="max-w-[1600px] mx-auto px-4 py-3 flex flex-wrap items-center justify-between gap-2">
+            <div class="flex items-center gap-3">
+              <h1 class="text-lg font-semibold tracking-tight">AI Student <span class="text-room-accent">Observation Room</span></h1>
+              <span class="text-xs px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 border border-slate-600" title="Hidden internal notes count">Memory: ${state.notesLog.length} notes</span>
+              <span class="text-xs px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 border border-slate-600" title="Selected Gemini model">Model: ${escapeHtml(state.model)}</span>
+            </div>
+            <div class="flex items-center gap-2 text-xs">
+              ${state.statusLine ? `<span class="text-amber-400/90">${escapeHtml(state.statusLine)}</span>` : ''}
+              ${state.busy ? `<span class="text-blue-300 animate-pulse">${escapeHtml(state.busyLabel || 'Working…')}</span>` : ''}
+              <button type="button" id="btn-change-model" class="text-slate-400 hover:text-white underline-offset-2 hover:underline">Change model</button>
+              <button type="button" id="btn-reset-key" class="text-slate-400 hover:text-white underline-offset-2 hover:underline">Reset key</button>
+            </div>
+          </div>
+        </header>
+
+        ${state.error ? `<div class="max-w-[1600px] mx-auto px-4 pt-3"><div class="bg-red-900/40 border border-red-700 text-red-200 text-sm rounded-lg px-3 py-2">${escapeHtml(state.error)}</div></div>` : ''}
+
+        <main class="max-w-[1600px] mx-auto px-4 py-4 flex flex-col lg:flex-row gap-4 min-h-[calc(100vh-64px)]">
+          <!-- Left: Observation Room -->
+          <section class="flex-1 min-h-[420px] flex flex-col bg-room-panel border border-slate-800 rounded-xl overflow-hidden">
+            <div class="px-4 py-2 border-b border-slate-800 text-sm font-medium text-slate-300">Observation Room</div>
+            <div id="chat-scroll" class="flex-1 overflow-y-auto p-4 space-y-3 min-h-[280px] max-h-[60vh] lg:max-h-none">
+              ${state.chat.length === 0 ? `<p class="text-slate-500 text-sm">Teach the AI from absolute zero. It will ask a clarifying question each turn.</p>` : ''}
+              ${state.chat
+                .map((m) =>
+                  m.role === 'teacher'
+                    ? `<div class="flex justify-end"><div class="max-w-[85%] bg-blue-600/30 border border-blue-500/40 rounded-2xl rounded-tr-sm px-4 py-2 text-sm">${escapeHtml(m.text)}</div></div>`
+                    : `<div class="flex justify-start"><div class="max-w-[85%] bg-slate-800 border border-slate-700 rounded-2xl rounded-tl-sm px-4 py-2 text-sm">
+                        <div>${escapeHtml(m.shortReply)}</div>
+                        <div class="mt-2 text-slate-400 italic text-xs">${escapeHtml(m.clarifyingQuestion)}</div>
+                      </div></div>`
+                )
+                .join('')}
+            </div>
+            <div class="p-3 border-t border-slate-800 flex gap-2">
+              <textarea id="teacher-input" rows="2" class="flex-1 bg-room-bg border border-slate-600 rounded-lg px-3 py-2 text-sm resize-none focus:ring-2 focus:ring-room-accent outline-none" placeholder="Explain a concept to the student…" ${state.busy ? 'disabled' : ''}></textarea>
+              <button type="button" id="btn-send" class="self-end px-4 py-2 bg-room-accent hover:bg-blue-500 text-white text-sm font-medium rounded-lg disabled:opacity-50" ${state.busy ? 'disabled' : ''}>Send</button>
+            </div>
+          </section>
+
+          <!-- Right: Teacher Hub -->
+          <section class="lg:w-[440px] shrink-0 flex flex-col bg-room-panel border border-slate-800 rounded-xl overflow-hidden min-h-[420px]">
+            <div class="flex border-b border-slate-800">
+              ${tabs
+                .map(
+                  (t) =>
+                    `<button type="button" data-tab="${t}" class="flex-1 px-2 py-2 text-xs sm:text-sm border-b-2 ${
+                      state.activeTab === t ? 'border-room-accent text-white bg-room-bg/50' : 'border-transparent text-slate-400 hover:text-slate-200'
+                    }">${t === 'upload' ? 'Upload' : t === 'study' ? 'Study Guide' : t === 'exam' ? 'Exam' : 'Results'}</button>`
+                )
+                .join('')}
+            </div>
+            <div id="hub-body" class="flex-1 overflow-y-auto p-4 text-sm"></div>
+          </section>
+        </main>
+
+        <footer class="max-w-[1600px] mx-auto px-4 pb-6 text-center text-xs text-slate-600">
+          Open this file locally in a modern browser. Uses Gemini REST API. Teaching session resets on refresh (by design).
+        </footer>
+      `;
+
+      const hub = root.querySelector('#hub-body');
+      if (hub) hub.innerHTML = renderHubBody();
+
+      wireEvents();
+      const scroll = root.querySelector('#chat-scroll');
+      if (scroll) scroll.scrollTop = scroll.scrollHeight;
+    }
+
+    function renderHubBody() {
+      if (state.activeTab === 'upload') {
+        return `
+          <p class="text-slate-400 mb-3">Upload homework PDF or image. The model synthesizes broad topics and builds rubric questions.</p>
+          <input type="file" id="file-input" accept=".pdf,image/*,application/pdf" class="block w-full text-xs text-slate-300 file:mr-3 file:py-2 file:px-3 file:rounded-lg file:border-0 file:bg-slate-700 file:text-slate-200" ${state.busy ? 'disabled' : ''} />
+          <button type="button" id="btn-analyze" class="mt-3 w-full py-2 bg-slate-700 hover:bg-slate-600 rounded-lg text-sm font-medium" ${state.busy ? 'disabled' : ''}>Analyze document</button>
+        `;
+      }
+      if (state.activeTab === 'study') {
+        if (!state.analysis) {
+          return `<p class="text-slate-500">Run analysis on the Upload tab first.</p>`;
+        }
+        const a = state.analysis;
+        const rubricToggle = state.showRubric
+          ? `<button type="button" id="btn-hide-rubric" class="text-xs text-room-accent underline mb-2">Hide rubric</button>`
+          : `<button type="button" id="btn-show-rubric" class="text-xs text-room-accent underline mb-2">Show rubric (teacher)</button>`;
+        return `
+          <div class="mb-3">
+            <div class="text-xs uppercase text-slate-500 mb-1">Broad topics</div>
+            <div class="flex flex-wrap gap-2">${a.broadTopics.map((t) => `<span class="text-xs px-2 py-1 rounded-full bg-slate-800 border border-slate-600">${escapeHtml(t)}</span>`).join('')}</div>
+          </div>
+          ${rubricToggle}
+          <div class="space-y-4">
+            ${a.questions
+              .map(
+                (q) => `
+              <div class="border border-slate-700 rounded-lg p-3 bg-room-bg/50">
+                <div class="text-xs text-slate-500 mb-1">${escapeHtml(q.topic)} · ${escapeHtml(q.id)}</div>
+                <div class="text-slate-200 mb-2">${escapeHtml(q.prompt)}</div>
+                ${
+                  state.showRubric
+                    ? `<ul class="list-decimal list-inside text-xs text-slate-400 space-y-1">${q.goldenBullets.map((b) => `<li>${escapeHtml(b)}</li>`).join('')}</ul>`
+                    : `<div class="text-xs text-slate-600">Rubric hidden</div>`
+                }
+              </div>`
+              )
+              .join('')}
+            <div class="text-xs uppercase text-slate-500 mt-4 mb-1">Mastery challenges</div>
+            ${a.masteryChallenges
+              .map(
+                (mc, i) => `
+              <div class="border border-amber-900/50 rounded-lg p-3 bg-amber-950/20">
+                <div class="text-xs text-amber-200/80 mb-1">${escapeHtml(mc.topic)}</div>
+                <div class="text-slate-200 mb-2">${escapeHtml(mc.prompt)}</div>
+                ${
+                  state.showRubric
+                    ? `<ul class="list-decimal list-inside text-xs text-slate-400 space-y-1">${mc.goldenBullets.map((b) => `<li>${escapeHtml(b)}</li>`).join('')}</ul>`
+                    : ''
+                }
+              </div>`
+              )
+              .join('')}
+          </div>
+        `;
+      }
+      if (state.activeTab === 'exam') {
+        if (!state.analysis) {
+          return `<p class="text-slate-500">Analyze a document first.</p>`;
+        }
+        const items = buildExamItemsList();
+        return `
+          <p class="text-slate-400 mb-3">Deploy runs the exam: the student answers each item using only TEACHING CONTEXT from Memory notes.</p>
+          <button type="button" id="btn-deploy" class="w-full py-2 bg-emerald-700 hover:bg-emerald-600 rounded-lg font-medium mb-4" ${state.busy ? 'disabled' : ''}>Deploy exam (run student)</button>
+          <div class="space-y-3">
+            ${items
+              .map(
+                (item) => `
+              <div class="border border-slate-700 rounded-lg p-3">
+                <div class="text-xs text-slate-500 mb-1">${escapeHtml(item.label)} · ${escapeHtml(item.id)}</div>
+                <div class="text-slate-200 text-sm mb-2">${escapeHtml(item.prompt)}</div>
+                <div class="text-xs text-slate-400 bg-room-bg rounded px-2 py-2 border border-slate-800 whitespace-pre-wrap">${escapeHtml(state.examAnswers[item.id] || '—')}</div>
+              </div>`
+              )
+              .join('')}
+          </div>
+          <button type="button" id="btn-grade" class="w-full mt-4 py-2 bg-violet-700 hover:bg-violet-600 rounded-lg font-medium" ${state.busy || !Object.keys(state.examAnswers).length ? 'disabled' : ''}>Grade all</button>
+        `;
+      }
+      // results
+      if (!state.grades.length) {
+        return `<p class="text-slate-500">No grades yet. Run Deploy exam, then Grade all.</p>`;
+      }
+      let totalEarned = 0;
+      let totalPossible = 0;
+      const blocks = state.grades
+        .map((g) => {
+          totalEarned += g.pointsEarned;
+          totalPossible += g.pointsPossible;
+          const missed = (g.missedBullets || []).map((i) => `[${i}]`).join(', ');
+          const hit = (g.hitBullets || []).map((i) => `[${i}]`).join(', ');
+          return `
+          <div class="border border-slate-700 rounded-lg p-3 mb-3">
+            <div class="flex justify-between items-center mb-2">
+              <span class="text-xs text-slate-400">${escapeHtml(g.questionId)}</span>
+              <span class="text-sm font-semibold text-emerald-300">${g.pointsEarned} / ${g.pointsPossible} pts</span>
+            </div>
+            <p class="text-xs text-slate-300 mb-2">${escapeHtml(g.feedback)}</p>
+            <div class="text-xs text-slate-500">Hit: ${hit || '—'}</div>
+            <div class="text-xs text-slate-500">Missed: ${missed || '—'}</div>
+          </div>`;
+        })
+        .join('');
+      return `
+        <div class="mb-4 p-3 rounded-lg bg-slate-800/80 border border-slate-600 text-center">
+          <div class="text-xs text-slate-400">Total</div>
+          <div class="text-2xl font-bold text-white">${totalEarned} / ${totalPossible}</div>
+        </div>
+        ${blocks}
+      `;
+    }
+
+    function buildExamItemsList() {
+      if (!state.analysis) return [];
+      const q = state.analysis.questions.map((x) => ({
+        id: x.id,
+        kind: 'question',
+        label: x.topic,
+        prompt: x.prompt,
+        goldenBullets: x.goldenBullets,
+      }));
+      const m = state.analysis.masteryChallenges.map((x, i) => ({
+        id: `mastery_${i}`,
+        kind: 'mastery',
+        label: `Mastery · ${x.topic}`,
+        prompt: x.prompt,
+        goldenBullets: x.goldenBullets,
+      }));
+      return [...q, ...m];
+    }
+
+    function wireEvents() {
+      root.querySelector('#key-save')?.addEventListener('click', () => {
+        const inp = root.querySelector('#key-input');
+        const modelEl = root.querySelector('#model-select');
+        const v = inp?.value?.trim();
+        saveModel(modelEl?.value || FREE_TIER_MODELS[0].id);
+        if (!state.apiKey && !v) return;
+        if (v) saveKey(v);
+        state.showSettingsModal = false;
+        render();
+      });
+      root.querySelector('#settings-cancel')?.addEventListener('click', () => {
+        state.showSettingsModal = false;
+        render();
+      });
+
+      root.querySelector('#btn-reset-key')?.addEventListener('click', () => {
+        if (confirm('Clear stored API key?')) {
+          saveKey('');
+          state.showSettingsModal = false;
+          state.activeTab = 'upload';
+          state.statusLine = '';
+          render();
+        }
+      });
+      root.querySelector('#btn-change-model')?.addEventListener('click', () => {
+        state.showSettingsModal = true;
+        render();
+      });
+
+      root.querySelectorAll('[data-tab]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          state.activeTab = btn.getAttribute('data-tab');
+          render();
+        });
+      });
+
+      root.querySelector('#btn-send')?.addEventListener('click', onTeacherSend);
+      root.querySelector('#teacher-input')?.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+          e.preventDefault();
+          onTeacherSend();
+        }
+      });
+
+      root.querySelector('#btn-analyze')?.addEventListener('click', onAnalyze);
+      root.querySelector('#btn-show-rubric')?.addEventListener('click', () => {
+        state.showRubric = true;
+        render();
+      });
+      root.querySelector('#btn-hide-rubric')?.addEventListener('click', () => {
+        state.showRubric = false;
+        render();
+      });
+      root.querySelector('#btn-deploy')?.addEventListener('click', onDeployExam);
+      root.querySelector('#btn-grade')?.addEventListener('click', onGradeAll);
+    }
+
+    // =============================================================================
+    // ---- handlers ----
+    // =============================================================================
+    async function onTeacherSend() {
+      const ta = root.querySelector('#teacher-input');
+      const text = ta?.value?.trim();
+      if (!text || state.busy) return;
+
+      state.chat.push({ role: 'teacher', text });
+      ta.value = '';
+      setBusy(true, 'Student thinking…');
+      try {
+        const prior = state.chat.slice(0, -1);
+        const userText = buildTeachingUserPayload(text, prior);
+        const raw = await callGemini({
+          systemInstruction: TEACHING_SYSTEM,
+          userText,
+          responseJson: true,
+        });
+        const parsed = parseJsonLoose(raw);
+        const notes = parsed.internalNotes || {};
+        state.notesLog.push({
+          concept: notes.concept || '',
+          facts: Array.isArray(notes.facts) ? notes.facts : [],
+          links: Array.isArray(notes.links) ? notes.links : [],
+        });
+        state.chat.push({
+          role: 'student',
+          shortReply: parsed.shortReply || '…',
+          clarifyingQuestion: parsed.clarifyingQuestion || 'Can you clarify?',
+        });
+      } catch (e) {
+        state.chat.pop();
+        setError(e);
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    async function onAnalyze() {
+      const fi = root.querySelector('#file-input');
+      const file = fi?.files?.[0];
+      if (!file || state.busy) return;
+
+      setBusy(true, 'Analyzing document…');
+      try {
+        const b64 = await readFileAsBase64(file);
+        const part = fileToGenerativePart(file, b64);
+        const userParts = [
+          part,
+          {
+            text: 'Analyze this homework document and produce ONLY the JSON per your instructions.',
+          },
+        ];
+        const raw = await callGemini({
+          systemInstruction: ANALYZER_SYSTEM,
+          parts: userParts,
+          responseJson: true,
+        });
+        const parsed = parseJsonLoose(raw);
+        if (!Array.isArray(parsed.broadTopics) || !Array.isArray(parsed.questions)) {
+          throw new Error('Invalid analysis JSON');
+        }
+        state.analysis = {
+          broadTopics: parsed.broadTopics.filter((x) => typeof x === 'string'),
+          questions: parsed.questions.map((q, i) => ({
+            id: typeof q?.id === 'string' && q.id.trim() ? q.id : `q${i + 1}`,
+            topic: typeof q?.topic === 'string' ? q.topic : 'General',
+            prompt: typeof q?.prompt === 'string' ? q.prompt : '',
+            goldenBullets: Array.isArray(q?.goldenBullets)
+              ? q.goldenBullets.map((b) => String(b))
+              : [],
+          })),
+          masteryChallenges: Array.isArray(parsed.masteryChallenges)
+            ? parsed.masteryChallenges.map((mc) => ({
+                topic: typeof mc?.topic === 'string' ? mc.topic : 'Mastery',
+                prompt: typeof mc?.prompt === 'string' ? mc.prompt : '',
+                goldenBullets: Array.isArray(mc?.goldenBullets)
+                  ? mc.goldenBullets.map((b) => String(b))
+                  : [],
+              }))
+            : [],
+        };
+        state.examAnswers = {};
+        state.grades = [];
+        state.activeTab = 'study';
+        state.statusLine = 'Document analyzed.';
+      } catch (e) {
+        setError(e);
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    async function onDeployExam() {
+      if (!state.analysis || state.busy) return;
+      const items = buildExamItemsList();
+      state.examAnswers = {};
+      state.grades = [];
+
+      setBusy(true, 'Running exam…');
+      try {
+        for (const item of items) {
+          const raw = await callGemini({
+            systemInstruction: STUDENT_EXAM_INSTRUCTION,
+            userText: buildExamUserMessage(item.prompt),
+            responseJson: true,
+          });
+          let ans = '';
+          try {
+            const parsed = parseJsonLoose(raw);
+            ans = parsed.examAnswer != null ? String(parsed.examAnswer) : '';
+          } catch {
+            ans = String(raw).trim();
+          }
+          state.examAnswers[item.id] = ans;
+        }
+        state.statusLine = 'Exam complete. Review answers, then Grade.';
+        state.activeTab = 'exam';
+      } catch (e) {
+        setError(e);
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    async function onGradeAll() {
+      const items = buildExamItemsList();
+      if (!items.length || state.busy) return;
+
+      setBusy(true, 'Grading…');
+      state.grades = [];
+      try {
+        for (const item of items) {
+          const studentAnswer = state.examAnswers[item.id] || '';
+          const raw = await callGemini({
+            systemInstruction: GRADER_SYSTEM,
+            userText: buildGraderUserContent(item.id, item.prompt, item.goldenBullets, studentAnswer),
+            responseJson: true,
+          });
+          const g = parseJsonLoose(raw);
+          const hits = Array.isArray(g.hitBullets) ? g.hitBullets : [];
+          const missed = Array.isArray(g.missedBullets) ? g.missedBullets : [];
+          const possible = item.goldenBullets.length;
+          const earned = Math.min(hits.length, possible);
+          state.grades.push({
+            questionId: g.questionId || item.id,
+            hitBullets: hits,
+            missedBullets: missed,
+            pointsEarned: earned,
+            pointsPossible: possible,
+            feedback: g.feedback || '',
+          });
+        }
+        state.activeTab = 'results';
+        state.statusLine = 'Grading complete.';
+      } catch (e) {
+        setError(e);
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    // =============================================================================
+    // ---- bootstrap ----
+    // =============================================================================
+    loadSettings();
+    render();
+  </script>
+</body>
+</html>
