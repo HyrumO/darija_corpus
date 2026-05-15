@@ -19,3 +19,27 @@ Validate the inline script syntax (optional):
 ```bash
 node _check-syntax.mjs
 ```
+
+## Publish to GitHub
+
+This folder is ready as a Git repo (`main`, initial commit). To create a remote and push:
+
+1. Install and sign in with [GitHub CLI](https://cli.github.com/) (if needed):
+
+   ```powershell
+   winget install --id GitHub.cli -e --accept-package-agreements --accept-source-agreements
+   gh auth login
+   ```
+
+2. From this directory, create the GitHub repo and push (pick a unique name):
+
+   ```powershell
+   gh repo create YOUR-USERNAME/ai-student-observation-room --public --source=. --remote=origin --push
+   ```
+
+Alternative without `gh`: create an empty repo on GitHub, then:
+
+```powershell
+git remote add origin https://github.com/YOUR-USERNAME/YOUR-REPO.git
+git push -u origin main
+```
